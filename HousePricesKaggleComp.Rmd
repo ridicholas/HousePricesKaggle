@@ -2,14 +2,14 @@
 title: "House Prices Kaggle Comp"
 author: "Nicholas Wolczynski"
 date: "2/23/2019"
-output: pdf_document
+output: rmarkdown::github_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Setup + Data Exploration + Data Cleaning
+# Setup + Data Exploration + Data Preparation
 
 ```{r include = FALSE}
 ## load libraries
@@ -19,11 +19,18 @@ library(ggplot2)
 library(scales)
 library(gridExtra)
 library(tree)
-
-#load training data
-train <- read.csv("train.csv")
-
+library(pls)
+library(dataPreparation)
+library(GGally)
+library(moments)
 ```
+
+```{r}
+#load data
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+```
+
 
 We are trying to build a model that best predicts housing sales price based on the predictors. First, lets look at the dimensions of our dataset. 
 
@@ -58,7 +65,7 @@ Now let's move onto our predictors. First, there are several predictors with NA 
 colSums(is.na(train))[colSums(is.na(train)) > 0]
 ```
 
-A few variables seem to be NA for almost the entire dataset ("Alley", "PoolQC", "Fence", "MiscFeature"). First, let's take a quick look and see if there is a relationship
+A few variables seem to be NA for almost the entire dataset ("Alley", "PoolQC", "Fence", "MiscFeature"). First, let's take a quick look and see if these could still be useful. 
 
 ```{r}
 plot1 <- ggplot(train, aes(x = Alley, y = SalePrice)) + 
@@ -80,13 +87,13 @@ plot4 <- ggplot(train, aes(x = MiscFeature, y = SalePrice)) +
 grid.arrange(plot1, plot2, plot3, plot4, ncol=2)
 ```
 
-Although these features primarily take NA values, it seems that there could be a strong relationship with the response and the non-NA values of these features, so it can be worthwhile to leave these features in. In order to do so, we need to add another level to each factor feature, and then convert the NA values to that new value. 
+Although these features primarily take NA values, it seems that there could be a strong relationship with the response and the non-NA values of these features, so it can be worthwhile to leave these features in and let the model decide. In order to do so, we need to add another level to each factor feature, and then convert the NA values to that new value. 
+
 
 ```{r}
-
 ##function that will add "NA" factor to factor columns with NA values
 addNA <- function(x){
-  if(is.factor(x) & sum(is.na(x)) > 0) return(factor(x, levels=c(levels(x), "NA")))
+  if(is.factor(x)) return(factor(x, levels=c(levels(x), "NA")))
   return(x)
 }
 
@@ -101,33 +108,250 @@ train[, lapply(train,is.factor) == TRUE][is.na(train[, lapply(train,is.factor) =
 
 ## replace remaining integer feature NA values with 0/
 train[is.na(train)] <- 0
+
+
+##lets do the same to the test data
+
+test <- as.data.frame(lapply(test, addNA))
+
+test[, lapply(test,is.factor) == TRUE][is.na(test[, lapply(test,is.factor) == TRUE])] <- "NA"
+
+test[is.na(test)] <- 0
+```
+
+Our numeric predictors might also be heavily skewed or have high kurtosis. It is unreasonable to investigate density plots of each of our predictors, so lets just take a look at kurtosis and skewness measures to see whether there are any features that could benefit from scaling. 
+
+```{r}
+
+skew <- data.frame("Feature" = names(skewness(train[, sapply(train, is.numeric)])), "Skew" = skewness(train[, sapply(train, is.numeric)]))
+
+kurt <- data.frame("Feature" = names(kurtosis(train[, sapply(train, is.numeric)])), "Kurtosis" = kurtosis(train[, sapply(train, is.numeric)]))
+
+
+ggplot(skew, aes(x = Feature, y = Skew)) + geom_bar(stat = "identity") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle("Skewness")
+
+ggplot(kurt, aes(x = Feature, y = Kurtosis)) + geom_bar(stat = "identity") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle("Kurtosis")
+
+```
+
+```{r}
+top_n(skew, 5)
+top_n(kurt, 5)
+```
+
+It appears the same 5 features have much higher skew and kurtosis than all the rest. We should make sure to scale these features. 
+
+
+```{r}
+scales <- build_scales(dataSet = train, cols = top_n(skew, 5)$Feature)
+```
+
+```{r}
+scaleTrain <- fastScale(train, scales = scales, verbose = FALSE)
+scaleTest <- fastScale(test, scales = scales, verbose = FALSE)
+```
+
+
+Let's now see if there are any high leverage outliers in our data. I will check for by looking at the cook's distance and residuals of a standard linear model:
+
+```{r}
+lmod <- lm(log(SalePrice)~., data = scaleTrain[, -c("Id")])
+plot(lmod, which = c(1,2,5))
+```
+
+It appears that observations 826 and 524 have high residual values and high leverage:
+
+```{r}
+scaleTrain[c(826,524), ]
+```
+
+It is tough to tell what is going on with these points, but we know they could have a big impact on our model (high leverage) while not following the general trend. 
+
+```{r}
+scaleTrainNoOutliers <- scaleTrain[-c(826,524), ]
+```
+
+Let's do the process one more time to make sure there aren't any new observations that could cause problems. 
+
+```{r}
+lmod2 <- lm(log(SalePrice)~., data = scaleTrainNoOutliers[, -c("Id")])
+plot(lmod2, which = c(1,2,5))
+```
+
+Although there are some outliers, they are not high leverage, so it should be alright to proceed with the current dataset.
+
+
+```{r}
+encoding <- build_encoding(scaleTrainNoOutliers[ , -c("SalePrice", "Id")])
+train.x <- one_hot_encoder(data = scaleTrainNoOutliers[ , -c("SalePrice", "Id")], encoding = encoding, drop = TRUE, verbose = FALSE)
+test.x <- one_hot_encoder(data = scaleTest[, -c("Id")], encoding = encoding, drop = TRUE, verbose = FALSE)
+train.y <- log(scaleTrainNoOutliers$SalePrice)
+```
+
+Now that we've encoded, our matrix is likely very sparse, let's drop columns with only constant values, bijections, or doubles. 
+
+```{r}
+doubles <- whichAreInDouble(train.x, verbose = FALSE)
+train.x <- train.x[, -..doubles]
+test.x <- test.x[, -..doubles]
+bijections <- whichAreBijection(train.x, verbose = FALSE)
+train.x <- train.x[, -..bijections]
+test.x <- test.x[, -..bijections]
+constant <- whichAreConstant(train.x, verbose = FALSE)
+train.x <- train.x[, -..constant]
+test.x <- test.x[, -..constant]
+```
+
+A final check that our train and test datasets are of same structure. 
+
+```{r}
+dim(train.x)
+dim(test.x)
+test.x <- sameShape(test.x, referenceSet = train.x, verbose = TRUE)
 ```
 
 # Model Selection
 
-Lasso Regression: 
+I want to use a method that will reduce the dimensionality of our data while making accurate predictions. Good options are lasso and principle components regression. I will also try a ridge regression approach which does not eliminate features. 
+
+### Lasso Regression: 
 
 ```{r}
-x <- model.matrix(SalePrice~., train)
-y <- log(train$SalePrice)
+test.x.matrix <- model.matrix(~., test.x)
+train.x.matrix <- model.matrix(~., train.x)
 ```
 
 
 ```{r}
-mod.lasso = cv.glmnet(x, y, alpha = 1, nfolds = 5)
-bestlam = mod.lasso$lambda.min
-bestlam
+mod.lasso = cv.glmnet(train.x.matrix, train.y, alpha = 1, nfolds = 5)
+bestlam.lasso = mod.lasso$lambda.min
 ```
 
 ```{r}
 plot(mod.lasso)
 ```
 
-```{r include = FALSE}
-predict(mod.lasso, s = bestlam, type = "coefficients")
+```{r}
+bestlam.lasso
+min(sqrt(mod.lasso$cvm))
 ```
 
-```{r include = FALSE}
-min(mod.lasso$cvm)
+With lambda = 0.004, our model produces a root mean cross-validated error of 0.135. 
+
+```{r}
+finalmod.lasso <- glmnet(train.x.matrix, train.y, alpha = 1, lambda = bestlam.lasso)
 ```
+
+Now let's make predictions and submit to the kaggle comp!
+
+```{r}
+pred.lasso <- exp(predict(finalmod.lasso, newx = test.x.matrix))
+```
+
+
+```{r}
+predictions.lasso <- data.frame("Id" = test$Id, 
+                          "SalePrice" = pred.lasso)
+
+names(predictions.lasso)[2] <- "SalePrice"
+
+write.csv(x = predictions.lasso, "lassoPredicts.csv")
+```
+
+**Kaggle Score: ** 0.1233 
+
+### Ridge Regression: 
+
+```{r}
+mod.ridge = cv.glmnet(train.x.matrix, train.y, alpha = 0, nfolds = 5)
+bestlam.ridge = mod.ridge$lambda.min
+```
+
+```{r}
+plot(mod.ridge)
+```
+
+```{r}
+bestlam.ridge
+min(sqrt(mod.ridge$cvm))
+```
+
+With lambda = 0.12, our model produces a root mean cross-validated error of 0.134.
+
+```{r include}
+finalmod.ridge <- glmnet(train.x.matrix, train.y, alpha = 0, lambda = bestlam.ridge)
+```
+
+Now let's make predictions and submit to the kaggle comp!
+
+```{r}
+pred.ridge <- exp(predict(finalmod.ridge, newx = test.x.matrix))
+```
+
+
+```{r}
+predictions.ridge <- data.frame("Id" = test$Id, 
+                          "SalePrice" = pred.ridge)
+
+names(predictions.ridge)[2] <- "SalePrice"
+
+write.csv(x = predictions.ridge, "ridgePredicts.csv")
+```
+
+**Kaggle Score: ** Not yet submitted. 
+
+### Principle Components Regression
+
+```{r}
+train.x$SalePrice <- train.y
+```
+
+
+```{r}
+mod.pcr <- pcr(SalePrice~., data = train.x, validation = "CV", segments = 5, ncomp = 225)
+validationplot(mod.pcr, val.type="RMSEP", main = "Validation Plot")
+```
+
+It does not appear that there is not much advantage to suing more than ~ 25 principle components. Let's take a closer look at the validation plot:
+
+```{r}
+validationplot(mod.pcr, val.type="RMSEP", ncomp = 20:40, main = "Validation Plot")
+```
+
+It appears that 26 principle components is our ideal choice, and it performs just about as well as our lasso model (although taking more principle components could improve the model). Let's make predictions on the test data using both methods. 
+
+```{r}
+preds.pcr26 <- exp(predict(mod.pcr, newdata = test.x, ncomp = 26))
+
+predictions.pcr26 <- data.frame("Id" = test$Id, 
+                          "SalePrice" = preds.pcr26)
+
+names(predictions.pcr26)[2] <- "SalePrice"
+
+write.csv(x = predictions.pcr26, "pcr26Predicts.csv")
+
+```
+
+
+**Kaggle Score: ** .13696
+
+Lets try it with a higher amount of PCs: 
+
+```{r}
+preds.pcr85 <- exp(predict(mod.pcr, newdata = test.x, ncomp = 85))
+
+predictions.pcr85 <- data.frame("Id" = test$Id, 
+                          "SalePrice" = preds.pcr85)
+
+names(predictions.pcr85)[2] <- "SalePrice"
+
+write.csv(x = predictions.pcr85, "pcr85Predicts.csv")
+```
+
+**Kaggle Score: ** Not yet submitted
+
+# Final Comments
+
+Lasso regression is an excellent choice when making predictions thanks to its excellent performance and dimensionality reduction. Additionally, although not written about above, my initial predictions were based off data that was not scaled and outliers were not removed. Performing these steps as seen above led to significant improvement in test performance. 
+
 
